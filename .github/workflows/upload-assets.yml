@@ -24,9 +24,6 @@ jobs:
       - name: install vsce
         run: npm install -g @vscode/vsce
 
-      - name: build release binaries
-        run: cargo build --release
-
       - name: build
         shell: bash
         run: |

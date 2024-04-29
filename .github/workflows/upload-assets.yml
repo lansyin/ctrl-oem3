@@ -31,7 +31,6 @@ jobs:
           mkdir dist
           npm install
           vsce package --out="$outpath"
-          cp target/release/vscode-cjk-toggle-terminal-fixer.exe "$staging.exe"
           echo "ASSET=$outpath" >> $GITHUB_ENV
 
       - name: Upload Release Asset

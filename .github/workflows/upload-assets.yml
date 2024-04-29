@@ -20,7 +20,7 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > rustup-init.sh
           sh rustup-init.sh -y --default-toolchain none
           rustup target add x86_64-pc-windows-msvc
-      
+
       - name: install vsce
         run: npm install -g @vscode/vsce
 
@@ -28,7 +28,6 @@ jobs:
         shell: bash
         run: |
           outpath="ctrl-oem3-${{github.event.release.tag_name}}.vsix"
-          mkdir dist
           npm install
           vsce package --out="$outpath"
           echo "ASSET=$outpath" >> $GITHUB_ENV
@@ -43,4 +42,3 @@ jobs:
           asset_path: ${{ env.ASSET }}
           asset_name: ${{ env.ASSET }}
           asset_content_type: application/octet-stream
-          

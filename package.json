@@ -8,7 +8,7 @@
   },
   "license": "MIT",
   "icon": "icon.ico",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": {
     "name": "Little Lan",
     "email": "lansyin@foxmail.com"
@@ -64,9 +64,6 @@
     "esbuild": "npm run esbuild-base -- --sourcemap",
     "esbuild-watch": "npm run esbuild-base -- --sourcemap --watch",
     "compile-native": "cargo build --manifest-path=./native/Cargo.toml --target=x86_64-pc-windows-msvc --release && npx ncp ./native/target/x86_64-pc-windows-msvc/release/ctrl-oem3-native.exe ./dist/ctrl-oem3-native.exe",
-    "compile": "npm run compile-native & tsc -p ./",
-    "watch": "tsc -watch -p ./",
-    "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
     "test": "vscode-test"
   },
@@ -79,7 +76,9 @@
     "@vscode/test-electron": "^2.3.9",
     "esbuild": "^0.20.2",
     "eslint": "^8.57.0",
+    "eslint-config-prettier": "^9.1.0",
     "ncp": "^2.0.0",
+    "prettier": "3.2.5",
     "typescript": "^5.4.5"
   }
 }

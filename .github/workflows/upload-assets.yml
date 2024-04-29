@@ -1,0 +1,50 @@
+name: upload
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+
+jobs:
+  build-release:
+    name: build-release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: install rustup
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > rustup-init.sh
+          sh rustup-init.sh -y --default-toolchain none
+          rustup target add x86_64-pc-windows-msvc
+      
+      - name: install vsce
+        run: npm install -g @vscode/vsce
+
+      - name: build release binaries
+        run: cargo build --release
+
+      - name: build
+        shell: bash
+        run: |
+          outpath="ctrl-oem3-${{github.event.release.tag_name}}.vsix"
+          mkdir dist
+          npm install
+          vsce package --out="$outpath"
+          cp target/release/vscode-cjk-toggle-terminal-fixer.exe "$staging.exe"
+          echo "ASSET=$outpath" >> $GITHUB_ENV
+
+      - name: Upload Release Asset
+        if: github.event_name == 'release'
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ${{ env.ASSET }}
+          asset_name: ${{ env.ASSET }}
+          asset_content_type: application/octet-stream
+          

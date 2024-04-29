@@ -1,0 +1,85 @@
+{
+  "name": "ctrl-oem3",
+  "displayName": "CtrlOEM3",
+  "description": "Fixing the issue where 「Ctrl+`」 doesn't work with some CJK keyboards/IMEs in VSCode.",
+  "repository": {
+    "url": "https://github.com/lanlytt/ctrl-oem3",
+    "type": "git"
+  },
+  "license": "MIT",
+  "icon": "icon.ico",
+  "version": "0.1.0",
+  "author": {
+    "name": "Little Lan",
+    "email": "lansyin@foxmail.com"
+  },
+  "publisher": "lanlytt",
+  "untrustedWorkspaces": {
+    "supported": true
+  },
+  "engines": {
+    "vscode": "^1.88.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "ctrl-oem3.start",
+        "title": "CtrlOEM3: Start"
+      },
+      {
+        "command": "ctrl-oem3.stop",
+        "title": "CtrlOEM3: Stop"
+      }
+    ],
+    "configuration": {
+      "title": "CtrlOEM3",
+      "properties": {
+        "ctrl-oem3.autostart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Launch with VSCode. "
+        },
+        "ctrl-oem3.matches-window-title": {
+          "type": "string",
+          "default": "^(?:.* - )?Visual Studio Code$",
+          "description": "Mimic keypress only if this matches the title of foreground window. "
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile-boundle",
+    "compile-boundle": "npm run esbuild-base -- --minify && npm run compile-native",
+    "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node",
+    "esbuild": "npm run esbuild-base -- --sourcemap",
+    "esbuild-watch": "npm run esbuild-base -- --sourcemap --watch",
+    "compile-native": "cargo build --manifest-path=./native/Cargo.toml --target=x86_64-pc-windows-msvc --release && npx ncp ./native/target/x86_64-pc-windows-msvc/release/ctrl-oem3-native.exe ./dist/ctrl-oem3-native.exe",
+    "compile": "npm run compile-native & tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/node": "18.x",
+    "@types/vscode": "^1.88.0",
+    "@typescript-eslint/eslint-plugin": "^7.7.1",
+    "@typescript-eslint/parser": "^7.7.1",
+    "@vscode/test-cli": "^0.0.8",
+    "@vscode/test-electron": "^2.3.9",
+    "esbuild": "^0.20.2",
+    "eslint": "^8.57.0",
+    "ncp": "^2.0.0",
+    "typescript": "^5.4.5"
+  }
+}

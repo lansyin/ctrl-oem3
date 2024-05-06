@@ -283,7 +283,7 @@ async fn keepalive_server() -> Result<()> {
 
 async fn handle_connection(
     mut conn: NamedPipeServer,
-    guard: idle::Active,
+    guard: idle::ActiveGuard,
     token: CancellationToken,
 ) {
     async move {
@@ -318,6 +318,7 @@ async fn handle_connection(
 
 mod idle {
     use std::{
+        result,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -325,72 +326,90 @@ mod idle {
         time::Duration,
     };
 
-    use tokio::{sync::Notify, time};
+    use futures::TryFutureExt;
+    use thiserror::Error;
+    use tokio::{sync::watch, time};
+
+    #[derive(Debug, Clone, Copy)]
+    enum State {
+        Active,
+        Idle,
+    }
+
+    #[derive(Debug, Error)]
+    pub enum Error {
+        #[error("the paired 'Observed' is dropped. ")]
+        Disconnected,
+    }
+
+    type Result<T> = result::Result<T, Error>;
 
     pub struct Observed {
         active_count: Arc<AtomicUsize>,
-        get_idle: Arc<Notify>,
+        state: watch::Sender<State>,
     }
 
     impl Observed {
-        pub fn get_active(&mut self) -> Active {
+        pub fn get_active(&mut self) -> ActiveGuard {
             let prev_count = self.active_count.fetch_add(1, Ordering::SeqCst);
             if prev_count == 0 {
-                self.get_idle.notify_one();
+                self.state.send_replace(State::Active);
             }
-            Active {
+            ActiveGuard {
                 active_count: self.active_count.clone(),
-                get_idle: self.get_idle.clone(),
+                state: self.state.clone(),
             }
         }
     }
 
-    pub struct Active {
+    pub struct ActiveGuard {
         active_count: Arc<AtomicUsize>,
-        get_idle: Arc<Notify>,
+        state: watch::Sender<State>,
     }
 
-    impl Drop for Active {
+    impl Drop for ActiveGuard {
         fn drop(&mut self) {
             let prev_count = self.active_count.fetch_sub(1, Ordering::SeqCst);
             if prev_count == 1 {
-                self.get_idle.notify_one();
+                self.state.send_replace(State::Idle);
             }
         }
     }
 
     pub struct Idle {
         timeout: Duration,
-        notify: Arc<Notify>,
+        state: watch::Receiver<State>,
     }
 
     impl Idle {
         /// Cancel Safety
         /// This method is cancel safe.
-        pub async fn wait(self: &mut Self) {
+        pub async fn wait(&mut self) -> Result<()> {
             loop {
-                tokio::select! {
-                    _ = time::sleep(self.timeout) => break,
-                    _ = self.notify.notified() => (),
-                }
+                let state = *self.state.borrow_and_update();
+                let changed = self.state.changed().map_err(|_| Error::Disconnected);
 
-                self.notify.notified().await;
+                match state {
+                    State::Active => changed.await?,
+                    State::Idle => tokio::select! {
+                        _ = time::sleep(self.timeout) => break Ok(()),
+                        r = changed => r?,
+                    },
+                }
             }
         }
     }
 
     pub fn new_pair(timeout: Duration) -> (Observed, Idle) {
-        let active_count = Arc::new(AtomicUsize::new(0));
-        let get_idle = Arc::new(Notify::new());
+        let count = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = watch::channel(State::Idle);
+
         (
             Observed {
-                active_count: active_count.clone(),
-                get_idle: get_idle.clone(),
+                active_count: count,
+                state: tx,
             },
-            Idle {
-                timeout,
-                notify: get_idle,
-            },
+            Idle { timeout, state: rx },
         )
     }
 }

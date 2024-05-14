@@ -3,10 +3,11 @@
 use std::{
     fmt::Debug,
     future::Future,
+    io::ErrorKind,
     mem::{self, MaybeUninit},
     os::windows::io::AsRawHandle,
     panic::Location,
-    pin,
+    pin::{pin, Pin},
     sync::{Arc, Barrier},
     thread::{self, JoinHandle},
     time::Duration,
@@ -44,7 +45,7 @@ const WM_SHUTDOWN: u32 = WM_APP + 2;
 const ID_HOTKEY_CTRLOEM3: usize = 2333;
 
 const ID_INSTANCE: &str = "vscode_extension-ctrl_oem3-instance";
-const ID_PIPE_SERVER: &str = r"\\.\pipe\vscode_extension-ctrl_oem3";
+const ID_PIPE_SERVER: &str = env!("ctrl_oem3__named_pipe");
 
 const ID_PROTO_GET_STATUS: u8 = 71;
 const ID_PROTO_NOTIFY_STOP: u8 = 72;
@@ -53,7 +54,7 @@ const ID_PROTO_SAY_OK: u8 = 171;
 const ID_PROTO_GRIPE_REGEX: u8 = 172;
 
 static PATTERN_MATCHES_TITLE_DEFAULT: Lazy<Regex> =
-    Lazy::new(|| Regex::new(env!("CtrlOEM3_MatchesWindowTitle")).unwrap());
+    Lazy::new(|| Regex::new(env!("ctrl_oem3__matches_window_title")).unwrap());
 static PATTERN_MATCHES_TITLE: OnceCell<Regex> = OnceCell::new();
 
 #[derive(Parser)]
@@ -93,11 +94,11 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?
         .block_on(async {
-            let mut fut_forward_hotkey = pin::pin!(forward_hotkey());
-            let mut fut_keepalive_server = pin::pin!(keepalive_server());
+            let mut fut_forward_hotkey = pin!(forward_hotkey());
+            let mut fut_keepalive_server = pin!(keepalive_server());
 
             tokio::select! {
-                res = &mut fut_forward_hotkey=> res,
+                res = &mut fut_forward_hotkey => res,
                 res = &mut fut_keepalive_server =>res,
             }
         });
@@ -164,7 +165,7 @@ impl ForwardHotkey {
 impl Future for ForwardHotkey {
     type Output = Result<()>;
     fn poll(
-        mut self: pin::Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         self.rx
@@ -257,9 +258,9 @@ fn try_mimic_ctrl_oem3() {
 
 async fn keepalive_server() -> Result<()> {
     let (mut obs, mut idle) = idle::new_pair(Duration::from_secs(6));
-    let mut idle = pin::pin!(idle.wait());
+    let mut idle = pin!(idle.wait());
     let token = CancellationToken::new();
-    let mut cancelled = pin::pin!(token.cancelled());
+    let mut cancelled = pin!(token.cancelled());
 
     let mut server = ServerOptions::new()
         .first_pipe_instance(true)
@@ -288,9 +289,20 @@ async fn handle_connection(
 ) {
     async move {
         let _guard = guard;
+        let mut cancelled = pin!(token.cancelled());
+
         loop {
             let mut command = [0u8];
-            conn.read_exact(&mut command).await.ctx()?;
+
+            tokio::select! {
+                res = conn.read_exact(&mut command) => match res {
+                    Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+                    res => {
+                        res.ctx()?;
+                    },
+                },
+                _ = &mut cancelled => break,
+            }
 
             match command {
                 [ID_PROTO_GET_STATUS] => {
@@ -309,7 +321,6 @@ async fn handle_connection(
             }
         }
 
-        #[allow(unreachable_code)]
         Result::Ok(())
     }
     .await

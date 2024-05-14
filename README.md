@@ -6,10 +6,10 @@ You may download it directly from the releases page. It's automatically built by
 
 ## Requirements
 
-- Platform: x64 Windows 10/11
-- VSCode Version: 1.88.0 or later
+-   Platform: x64 Windows 10/11
+-   VSCode Version: 1.88.0 or later
 
 ## Caveats
 
-- It occupies the hotkey 「Ctrl+`」 globally whenever VSCode is running. 
-- It operates only if the window title matches a configurable regular expression, which is `/^(?: - )?Visual Studio Code/` by default. 
+-   It occupies the hotkey 「Ctrl+`」 globally whenever VSCode is running.
+-   It operates only if the window title matches a configurable regular expression, which is `/^(?: - )?Visual Studio Code/` by default.

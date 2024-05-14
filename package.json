@@ -8,7 +8,7 @@
   },
   "license": "MIT",
   "icon": "icon.ico",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "author": {
     "name": "Little Lan",
     "email": "lansyin@foxmail.com"
@@ -30,6 +30,7 @@
     "ui"
   ],
   "main": "./dist/extension.js",
+  "named-pipe": "\\\\.\\pipe\\vscode_extension-ctrl_oem3",
   "contributes": {
     "commands": [
       {
@@ -52,7 +53,7 @@
         "ctrl-oem3.matches-window-title": {
           "type": "string",
           "default": "^(?:.* - )?Visual Studio Code$",
-          "description": "Mimic keypress only if this matches the title of foreground window. "
+          "description": "Mimic the keypress messages only if it matches the title of the foreground window. "
         }
       }
     }

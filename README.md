@@ -2,7 +2,7 @@
 
 This extension fixes the issue where 「Ctrl+`」 doesn't work with some CJK keyboards/IMEs in VSCode.
 
-You may download it directly from the releases page. It's automatically built by Github Actions, so you should not worry about any tampering.
+You can download it directly from the releases page. It's automatically built by Github Actions, so you shouldn't have to worry about any tampering.
 
 ## Requirements
 

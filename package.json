@@ -3,7 +3,7 @@
   "displayName": "CtrlOEM3",
   "description": "Fixing the issue where 「Ctrl+`」 doesn't work with some CJK keyboards/IMEs in VSCode.",
   "repository": {
-    "url": "https://github.com/lanlytt/ctrl-oem3",
+    "url": "https://github.com/lansyin/ctrl-oem3",
     "type": "git"
   },
   "license": "MIT",

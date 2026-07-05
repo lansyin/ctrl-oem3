@@ -1,38 +1,38 @@
 #![windows_subsystem = "windows"]
 
+#[macro_use]
+extern crate tracing;
+
 use std::{
     fmt::Debug,
     future::Future,
     io::ErrorKind,
     mem::{self, MaybeUninit},
     os::windows::io::AsRawHandle,
-    panic::Location,
     pin::{pin, Pin},
     sync::{Arc, Barrier},
     thread::{self, JoinHandle},
     time::Duration,
 };
 
-use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
+use erratic::*;
 use futures::{channel::oneshot, FutureExt};
-
-use once_cell::sync::{Lazy, OnceCell};
 use regex::Regex;
-use single_instance::SingleInstance;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::windows::named_pipe::{NamedPipeServer, ServerOptions},
+    io::AsyncReadExt,
+    net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::Level;
-#[allow(unused_imports)]
-use tracing::{debug, error, info, trace, warn};
 use windows::Win32::{
     Foundation::{BOOL, HANDLE, HWND, LPARAM, WPARAM},
     System::Threading::GetThreadId,
     UI::{
-        Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_CONTROL, VK_OEM_3},
+        Input::KeyboardAndMouse::{
+            MapVirtualKeyW, RegisterHotKey, UnregisterHotKey, MAPVK_VK_TO_VSC, MOD_CONTROL,
+            VK_OEM_3,
+        },
         WindowsAndMessaging::{
             DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowTextW, PeekMessageW,
             PostMessageA, PostQuitMessage, PostThreadMessageW, TranslateMessage, MSG, PM_NOREMOVE,
@@ -41,21 +41,11 @@ use windows::Win32::{
     },
 };
 
-const WM_SHUTDOWN: u32 = WM_APP + 2;
-const ID_HOTKEY_CTRLOEM3: usize = 2333;
+const WM_APP_SHUTDOWN: u32 = WM_APP + 2;
+const KID_CTRLOEM3: usize = 2333;
+const PIPE_SERVER: &str = r"\\.\pipe\vscode.ext.ctrl-oem3";
 
-const ID_INSTANCE: &str = "vscode_extension-ctrl_oem3-instance";
-const ID_PIPE_SERVER: &str = env!("ctrl_oem3__named_pipe");
-
-const ID_PROTO_GET_STATUS: u8 = 71;
-const ID_PROTO_NOTIFY_STOP: u8 = 72;
-
-const ID_PROTO_SAY_OK: u8 = 171;
-const ID_PROTO_GRIPE_REGEX: u8 = 172;
-
-static PATTERN_MATCHES_TITLE_DEFAULT: Lazy<Regex> =
-    Lazy::new(|| Regex::new(env!("ctrl_oem3__matches_window_title")).unwrap());
-static PATTERN_MATCHES_TITLE: OnceCell<Regex> = OnceCell::new();
+const REQUEST_SHUTDOWN: u8 = 72;
 
 #[derive(Parser)]
 struct Cli {
@@ -71,48 +61,61 @@ impl Cli {
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_max_level(Level::INFO)
         .init();
 
-    let cli = Cli::try_parse()?;
-    PATTERN_MATCHES_TITLE
-        .get_or_try_init(|| Regex::new(&cli.matches_window_title))
-        .log_as_error();
+    let log_path = std::env::temp_dir().join("vscode.ext.ctrl-oem3.fatal.log");
 
-    let ctrloem3 = SingleInstance::new(ID_INSTANCE)?;
-    if !ctrloem3.is_single() {
-        info!("An existing CtrlOEM3 service is reused. ");
-        return Ok(());
-    } else {
-        info!("A new CtrlOEM3 service is created. ")
+    info!("ctrl-oem3 service started. ");
+    info!(
+        "file logging is enabled for fatal-level messages: {}",
+        log_path.display()
+    );
+
+    let Err(err) = main_() else {
+        info!("ctrl-oem3 service stopped. ");
+        return;
+    };
+
+    eprintln!("vscode.ext.ctrl-oem3.fatal: {err:?}");
+
+    if let Err(write_err) = std::fs::write(&log_path, format!("{err:?}")) {
+        eprintln!(
+            "vscode.ext.ctrl-oem3.fatal: also failed to write log to {}: {write_err}",
+            log_path.display()
+        );
     }
+}
 
-    let result = tokio::runtime::Builder::new_current_thread()
+fn main_() -> Result<()> {
+    let cli = Cli::try_parse()?;
+
+    info!("compiling pattern: {}", cli.matches_window_title);
+    let re = Regex::new(&cli.matches_window_title).with_context(mkctx!(
+        "failed to compile pattern: {}",
+        cli.matches_window_title
+    ))?;
+
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
         .block_on(async {
-            let mut fut_forward_hotkey = pin!(forward_hotkey());
+            let mut fut_forward_hotkey = pin!(forward_hotkey(re));
             let mut fut_keepalive_server = pin!(keepalive_server());
 
             tokio::select! {
                 res = &mut fut_forward_hotkey => res,
                 res = &mut fut_keepalive_server =>res,
             }
-        });
+        })?;
 
-    if let Err(ref err) = result {
-        error!("{err:?}");
-    }
-
-    info!("CtrlOEM3 service stopped. ");
-
-    result
+    Ok(())
 }
 
-fn forward_hotkey() -> ForwardHotkey {
+fn forward_hotkey(matches_regex: Regex) -> ForwardHotkey {
     let (tx, rx) = oneshot::channel();
     let barrier = Arc::new(Barrier::new(2));
     let barrier2 = barrier.clone();
@@ -125,9 +128,9 @@ fn forward_hotkey() -> ForwardHotkey {
         }
         barrier2.wait();
 
-        let res = forward_hotkey_sync();
+        let res = forward_hotkey_sync(&matches_regex);
         if let Err(err) = tx.send(res) {
-            error!("Unable to send hotkey forwarding result: {err:?}");
+            error!("unable to send hotkey forwarding result: {err:?}");
         };
     });
     barrier.wait();
@@ -149,11 +152,11 @@ impl ForwardHotkey {
         let handle = unsafe { self.jh.assume_init_ref().as_raw_handle() } as isize;
         let tid = unsafe { GetThreadId(HANDLE(handle)) };
         if tid == 0 {
-            warn!("Failed to get thread id, handle={handle:x} tid={tid:x}. ");
+            warn!("failed to get thread id, handle={handle:x} tid={tid:x}. ");
         } else {
             unsafe {
-                PostThreadMessageW(tid, WM_SHUTDOWN, None, None)
-                    .ctx()
+                PostThreadMessageW(tid, WM_APP_SHUTDOWN, None, None)
+                    .map_err(|err| mkerr!("failed to post WM_APP_SHUTDOWN: {err}"))
                     .log_as_warning();
             }
         }
@@ -176,27 +179,20 @@ impl Future for ForwardHotkey {
 
 impl Drop for ForwardHotkey {
     fn drop(&mut self) {
-        self.notify_quit().log_as_error();
+        self.notify_quit().log_as_warning();
         unsafe {
             self.jh
                 .assume_init_read()
                 .join()
-                .map_err(|_| anyhow!("Failed to join ForwardHotkey. "))
-                .log_as_error();
+                .map_err(|_| mkerr!("failed to wait hotkey thread to exit. "))
+                .log_as_warning();
         }
     }
 }
 
-fn forward_hotkey_sync() -> Result<()> {
-    unsafe {
-        RegisterHotKey(
-            None,
-            ID_HOTKEY_CTRLOEM3 as i32,
-            MOD_CONTROL,
-            VK_OEM_3.0 as _,
-        )
-    }
-    .ctx()?;
+fn forward_hotkey_sync(matches_regex: &Regex) -> Result<()> {
+    unsafe { RegisterHotKey(None, KID_CTRLOEM3 as i32, MOD_CONTROL, VK_OEM_3.0 as _) }
+        .with_context("failed to register hotkey")?;
 
     let mut msg: MSG = unsafe { mem::zeroed() };
     loop {
@@ -212,10 +208,10 @@ fn forward_hotkey_sync() -> Result<()> {
         }
 
         match msg.message {
-            WM_HOTKEY if matches!(msg.wParam, WPARAM(ID_HOTKEY_CTRLOEM3)) => {
-                try_mimic_ctrl_oem3();
+            WM_HOTKEY if matches!(msg.wParam, WPARAM(KID_CTRLOEM3)) => {
+                try_mimic_ctrl_oem3(matches_regex);
             }
-            WM_SHUTDOWN => unsafe {
+            WM_APP_SHUTDOWN => unsafe {
                 PostQuitMessage(0);
             },
             _ => {}
@@ -223,12 +219,12 @@ fn forward_hotkey_sync() -> Result<()> {
     }
 
     unsafe {
-        UnregisterHotKey(None, ID_HOTKEY_CTRLOEM3 as i32).ctx()?;
+        UnregisterHotKey(None, KID_CTRLOEM3 as i32).ok();
     }
     Ok(())
 }
 
-fn try_mimic_ctrl_oem3() {
+fn try_mimic_ctrl_oem3(matches_regex: &Regex) {
     unsafe {
         let hwnd = GetForegroundWindow();
         if matches!(hwnd, HWND(0)) {
@@ -240,31 +236,38 @@ fn try_mimic_ctrl_oem3() {
             let buffer_used_count = GetWindowTextW(hwnd, &mut buffer) as usize;
             String::from_utf16_lossy(&buffer[..buffer_used_count])
         };
-        if !PATTERN_MATCHES_TITLE
-            .get()
-            .unwrap_or(&PATTERN_MATCHES_TITLE_DEFAULT)
-            .is_match(&window_title)
-        {
+        if !matches_regex.is_match(&window_title) {
             return;
         }
 
-        for action in [WM_KEYDOWN, WM_KEYUP] {
-            PostMessageA(hwnd, action, WPARAM(VK_OEM_3.0 as usize), LPARAM(1))
-                .ctx()
-                .log_as_warning();
-        }
+        let scan_code = MapVirtualKeyW(VK_OEM_3.0 as _, MAPVK_VK_TO_VSC) as isize;
+        let lparam_down = LPARAM(1 | (scan_code << 16));
+        let lparam_up = LPARAM(1 | (scan_code << 16) | (1 << 30) | (1 << 31));
+
+        PostMessageA(hwnd, WM_KEYDOWN, WPARAM(VK_OEM_3.0 as usize), lparam_down)
+            .with_context("failed to mimic ctrl+oem3 to current window (keydown)")
+            .log_as_warning();
+        PostMessageA(hwnd, WM_KEYUP, WPARAM(VK_OEM_3.0 as usize), lparam_up)
+            .with_context("failed to mimic ctrl+oem3 to current window (keyup)")
+            .log_as_warning();
     }
 }
 
 async fn keepalive_server() -> Result<()> {
-    let (mut obs, mut idle) = idle::new_pair(Duration::from_secs(6));
-    let mut idle = pin!(idle.wait());
+    if ClientOptions::new().open(PIPE_SERVER).is_ok() {
+        info!("ctrl-oem3 service is already running, exit in favor of the existing one. ");
+        return Ok(());
+    }
+
+    let (mut wit, mut waiter) = idle::new_pair(Duration::from_secs(30));
+    let mut idle = pin!(waiter.wait());
     let token = CancellationToken::new();
     let mut cancelled = pin!(token.cancelled());
 
     let mut server = ServerOptions::new()
         .first_pipe_instance(true)
-        .create(ID_PIPE_SERVER)?;
+        .create(PIPE_SERVER)
+        .with_context("failed to create named pipe server")?;
 
     loop {
         tokio::select! {
@@ -274,9 +277,9 @@ async fn keepalive_server() -> Result<()> {
         };
 
         let conn = server;
-        server = ServerOptions::new().create(ID_PIPE_SERVER)?;
+        server = ServerOptions::new().create(PIPE_SERVER)?;
 
-        tokio::spawn(handle_connection(conn, obs.get_active(), token.clone()));
+        tokio::spawn(handle_connection(conn, wit.get_guard(), token.clone()));
     }
 
     Ok(())
@@ -284,7 +287,7 @@ async fn keepalive_server() -> Result<()> {
 
 async fn handle_connection(
     mut conn: NamedPipeServer,
-    guard: idle::ActiveGuard,
+    guard: idle::KeepaliveGuard,
     token: CancellationToken,
 ) {
     async move {
@@ -292,36 +295,29 @@ async fn handle_connection(
         let mut cancelled = pin!(token.cancelled());
 
         loop {
-            let mut command = [0u8];
+            let mut request = [0u8];
 
             tokio::select! {
-                res = conn.read_exact(&mut command) => match res {
-                    Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
-                    res => {
-                        res.ctx()?;
+                _ = &mut cancelled => break,
+                res = conn.read_exact(&mut request) => match res {
+                    Ok(_) => (),
+                    Err(err) if matches!(err.kind(), ErrorKind::UnexpectedEof | ErrorKind::TimedOut) => break,
+                    Err(err) => {
+                        return mkres!(error = err, "failed to read from named pipe")
                     },
                 },
-                _ = &mut cancelled => break,
             }
 
-            match command {
-                [ID_PROTO_GET_STATUS] => {
-                    let state = if PATTERN_MATCHES_TITLE.get().is_none() {
-                        ID_PROTO_GRIPE_REGEX
-                    } else {
-                        ID_PROTO_SAY_OK
-                    };
-                    conn.write(&[state]).await?;
-                    conn.flush().await?;
-                }
-                [ID_PROTO_NOTIFY_STOP] => {
+            match request {
+                [REQUEST_SHUTDOWN] => {
                     token.cancel();
+                    break
                 }
-                _ => bail!("Received unknown command: {command:?}"),
+                _ => return mkres!("received unknown request: {request:?}"),
             }
         }
 
-        Result::Ok(())
+        Ok(())
     }
     .await
     .log_as_warning();
@@ -349,36 +345,36 @@ mod idle {
 
     #[derive(Debug, Error)]
     pub enum Error {
-        #[error("the paired 'Observed' is dropped. ")]
+        #[error("the paired `Witness` is dropped. ")]
         Disconnected,
     }
 
     type Result<T> = result::Result<T, Error>;
 
-    pub struct Observed {
+    pub struct Witness {
         active_count: Arc<AtomicUsize>,
         state: watch::Sender<State>,
     }
 
-    impl Observed {
-        pub fn get_active(&mut self) -> ActiveGuard {
+    impl Witness {
+        pub fn get_guard(&mut self) -> KeepaliveGuard {
             let prev_count = self.active_count.fetch_add(1, Ordering::SeqCst);
             if prev_count == 0 {
                 self.state.send_replace(State::Active);
             }
-            ActiveGuard {
+            KeepaliveGuard {
                 active_count: self.active_count.clone(),
                 state: self.state.clone(),
             }
         }
     }
 
-    pub struct ActiveGuard {
+    pub struct KeepaliveGuard {
         active_count: Arc<AtomicUsize>,
         state: watch::Sender<State>,
     }
 
-    impl Drop for ActiveGuard {
+    impl Drop for KeepaliveGuard {
         fn drop(&mut self) {
             let prev_count = self.active_count.fetch_sub(1, Ordering::SeqCst);
             if prev_count == 1 {
@@ -387,13 +383,14 @@ mod idle {
         }
     }
 
-    pub struct Idle {
+    pub struct Waiter {
         timeout: Duration,
         state: watch::Receiver<State>,
     }
 
-    impl Idle {
-        /// Cancel Safety
+    impl Waiter {
+        /// # Cancel Safety
+        ///
         /// This method is cancel safe.
         pub async fn wait(&mut self) -> Result<()> {
             loop {
@@ -411,45 +408,29 @@ mod idle {
         }
     }
 
-    pub fn new_pair(timeout: Duration) -> (Observed, Idle) {
+    pub fn new_pair(timeout: Duration) -> (Witness, Waiter) {
         let count = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = watch::channel(State::Idle);
 
         (
-            Observed {
+            Witness {
                 active_count: count,
                 state: tx,
             },
-            Idle { timeout, state: rx },
+            Waiter { timeout, state: rx },
         )
     }
 }
 
 trait LogExt<T> {
-    fn ctx(self) -> Result<T>;
-    fn log_as_error(self) -> Option<T>;
     fn log_as_warning(self) -> Option<T>;
 }
 
 impl<T, E> LogExt<T> for std::result::Result<T, E>
 where
-    anyhow::Error: From<E>,
+    Error: From<E>,
     E: Debug,
 {
-    #[track_caller]
-    fn ctx(self) -> Result<T> {
-        let loc = Location::caller();
-        self.map_err(anyhow::Error::from)
-            .with_context(|| format!("at {}:{}", loc.file(), loc.line()))
-    }
-
-    fn log_as_error(self) -> Option<T> {
-        if let Err(err) = &self {
-            error!("{err:?}");
-        }
-        self.ok()
-    }
-
     fn log_as_warning(self) -> Option<T> {
         if let Err(err) = &self {
             warn!("{err:?}");

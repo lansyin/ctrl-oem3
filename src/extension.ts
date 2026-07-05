@@ -1,41 +1,98 @@
-// The module 'vscode' contains the VS Code extensibility API
-// Import the module and reference it with the alias vscode in your code below
 import * as vscode from 'vscode'
 import * as cproc from 'node:child_process'
 import * as net from 'net'
-import pkg from '../package.json'
 
-const ID_PIPE_SERVER = pkg['named-pipe']
+const PIPE_SERVER = String.raw`\\.\pipe\vscode.ext.ctrl-oem3`
+const REQUEST_SHUTDOWN = 72
 
-const ID_PROTO_GET_STATUS = 71
-const ID_PROTO_NOTIFY_STOP = 72
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms))
+}
 
-const ID_PROTO_SAY_OK = 171
-const ID_PROTO_GRIPE_REGEX = 172
+class PipeClient {
+    private _process?: cproc.ChildProcess
+    private _socket?: net.Socket
+    private _should_stop = false
+    private _started = false
+    private _on_disconnected?: () => void
+    private _status_bar: vscode.StatusBarItem
 
-const PIPE_CLIENT = new (class PipeClient {
-    client?: net.Socket
-    constructor() {}
-    connect(output?: vscode.OutputChannel) {
-        if (this.client !== undefined) {
-            this.disconnect()
-            output?.appendLine(
-                `** Dropping an existing connection to the CtrlOEM3 service. `
+    constructor(status_bar: vscode.StatusBarItem) {
+        this._status_bar = status_bar
+    }
+
+    get started() {
+        return this._started
+    }
+
+    async connect(nativePath: string, output: vscode.OutputChannel) {
+        this.disconnect()
+        this._should_stop = false
+        this._started = true
+
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            if (this._should_stop) break
+            let tag = attempt > 1 ? ` (${attempt}/3)` : ''
+            output.appendLine(`** Starting the CtrlOEM3 service.${tag}`)
+            this._set_error(`Connecting${tag}...`)
+
+            let pattern = vscode.workspace
+                .getConfiguration('ctrl-oem3')
+                .get<string>('matches-window-title')
+            let encoded = Buffer.from(
+                new TextEncoder().encode(pattern)
+            ).toString('base64')
+
+            const proc = cproc.spawn(
+                nativePath,
+                [`--matches-window-title=${encoded}`],
+                { detached: true }
             )
-        }
+            this._process = proc
 
-        let client = net.connect(ID_PIPE_SERVER)
-        this.client = client
+            if (proc.pid === undefined) {
+                output.appendLine('** Failed to spawn native process. ')
+                this._set_error(`Spawn failed${tag}`)
+                vscode.window
+                    .showErrorMessage(
+                        'Failed to start a CtrlOEM3 instance, check the output console for details. ',
+                        'Show Output',
+                        'Restart Extension'
+                    )
+                    .then((sel) => {
+                        switch (sel) {
+                            case 'Show Output':
+                                output.show()
+                                break
+                            case 'Restart Extension':
+                                vscode.commands.executeCommand('ctrl-oem3.stop')
+                                setTimeout(
+                                    () =>
+                                        vscode.commands.executeCommand(
+                                            'ctrl-oem3.start'
+                                        ),
+                                    500
+                                )
+                                break
+                        }
+                    })
+            }
 
-        client.on('connect', () => {
-            client?.write(Uint8Array.from([ID_PROTO_GET_STATUS]))
-        })
-        client.on('data', (data) => {
-            let router: { [key: number]: () => void } = {
-                [ID_PROTO_GRIPE_REGEX]: () => {
+            proc.stdout?.on('data', (data: any) =>
+                output.append(data.toString())
+            )
+            proc.stderr?.on('data', (data: any) => {
+                const text = data.toString()
+                output.append(text)
+                const fatal_prefix = 'vscode.ext.ctrl-oem3.fatal:'
+                if (text.includes(fatal_prefix)) {
+                    const msg_start =
+                        text.indexOf(fatal_prefix) + fatal_prefix.length
+                    const detail = text.substring(msg_start).trim()
+                    this._set_error(`Fatal error${tag}: ${detail}`)
                     vscode.window
                         .showErrorMessage(
-                            'Failed to compile `ctrl-oem3.matches-window-title`, check output console for details. ',
+                            `Fatal error: ${detail}`,
                             'Show Output',
                             'Edit Settings',
                             'Restart Extension'
@@ -53,83 +110,166 @@ const PIPE_CLIENT = new (class PipeClient {
                                     break
                                 case 'Restart Extension':
                                     vscode.commands.executeCommand(
-                                        'ctrl-oem3.stop'
+                                        'ctrl-oem3.restart'
                                     )
-                                    setTimeout(() => {
-                                        vscode.commands.executeCommand(
-                                            'ctrl-oem3.start'
-                                        )
-                                    }, 500)
                                     break
                             }
                         })
-                },
-                [ID_PROTO_SAY_OK]: () => {
-                    output?.appendLine(`** Connected to the CtrlOEM3 service. `)
-                },
-            }
-            for (let cmd of data) {
-                if (router[cmd] === undefined) {
-                    output?.appendLine(
-                        `** Received an unknown ACK=${cmd} from the CtrlOEM3 service. `
-                    )
-                } else {
-                    router[cmd]()
                 }
-            }
-        })
-        client.on('error', (err) => {
-            output?.appendLine(
-                `** Failed to connect to the CtrlOEM3 service: ${err}`
-            )
-            vscode.window
-                .showErrorMessage(
-                    'Failed to connect to the CtrlOEM3 service, check the output console for details. ',
-                    'Show Output',
-                    'Restart Extension'
+            })
+            proc.on('exit', (code) => {
+                output.appendLine(
+                    `** Current window's CtrlOEM3 instance exited, ExitCode=${code}. `
                 )
-                .then((sel) => {
-                    switch (sel) {
-                        case 'Restart Extension':
-                            vscode.commands.executeCommand('ctrl-oem3.start')
-                            break
-                        case 'Show Output':
-                            output?.show()
-                            break
-                    }
-                })
-        })
-        client.on('close', () => {
-            if (Object.is(this.client, client)) {
-                output?.appendLine(`** Disconnected to the CtrlOEM3 service. `)
-                this.disconnect()
-            } else {
-                output?.appendLine(
-                    `** An outdated connection to the CtrlOEM3 service dropped as notified. `
-                )
-            }
-        })
-    }
-    disconnect() {
-        this.client?.end()
-        this.client = undefined
-    }
-})()
+            })
 
-// This method is called when your extension is activated
-// Your extension is activated the very first time the command is executed
+            await sleep(500)
+            if (this._should_stop) break
+
+            try {
+                await this._try_connect(output)
+            } catch (err: any) {
+                output.appendLine(`** Connection failed${tag}: ${err.message}`)
+                this._set_error(`Connection failed${tag}`)
+                this._kill_process()
+                if (attempt < 3) {
+                    await sleep(15000)
+                }
+                continue
+            }
+
+            this._set_connected()
+            this._process = undefined
+            await new Promise<void>((resolve) => {
+                this._on_disconnected = resolve
+                if (this._socket === undefined) resolve()
+            })
+            this._on_disconnected = undefined
+            this._set_error('CtrlOEM3 service disconnected, click to restart')
+            return
+        }
+
+        this._set_error('Click to restart CtrlOEM3')
+        this._status_bar.command = 'ctrl-oem3.start'
+        output.appendLine('** All 3 connection attempts failed, giving up. ')
+    }
+
+    disconnect() {
+        this._should_stop = true
+        this._started = false
+        this._socket?.end()
+        this._socket = undefined
+        this._kill_process()
+        this._on_disconnected?.()
+    }
+
+    private _set_connected() {
+        this._status_bar.text = 'CtrlOEM3'
+        this._status_bar.tooltip = 'CtrlOEM3 active: click to view output'
+        this._status_bar.command = 'ctrl-oem3.show-output'
+        this._status_bar.backgroundColor = undefined
+        this._status_bar.show()
+    }
+
+    private _set_error(tooltip: string) {
+        this._status_bar.text = '$(warning) CtrlOEM3'
+        this._status_bar.tooltip = tooltip
+        this._status_bar.command = 'ctrl-oem3.restart'
+        this._status_bar.backgroundColor = new vscode.ThemeColor(
+            'statusBarItem.warningBackground'
+        )
+        this._status_bar.show()
+    }
+
+    private _try_connect(output: vscode.OutputChannel): Promise<void> {
+        return new Promise((resolve, reject) => {
+            const socket = net.connect(PIPE_SERVER)
+            this._socket = socket
+
+            socket.on('close', () => {
+                this._socket = undefined
+                this._on_disconnected?.()
+            })
+
+            const timer = setTimeout(() => {
+                socket.destroy()
+                reject(new Error('connection timeout'))
+            }, 3000)
+
+            socket.on('connect', () => {
+                clearTimeout(timer)
+                output.appendLine('** Connected to the CtrlOEM3 service. ')
+                resolve()
+            })
+
+            socket.on('error', (err) => {
+                clearTimeout(timer)
+                reject(err)
+            })
+        })
+    }
+
+    private _kill_process() {
+        if (this._process) {
+            this._process.kill()
+            this._process = undefined
+        }
+    }
+}
+
+let PIPE_CLIENT: PipeClient | undefined
+
 export function activate(context: vscode.ExtensionContext) {
     let native_path = context.asAbsolutePath('dist/ctrl-oem3-native.exe')
     let output = vscode.window.createOutputChannel('CtrlOEM3')
 
-    let start = vscode.commands.registerCommand('ctrl-oem3.start', () => {
-        command_start(native_path, output)
+    let status_bar = vscode.window.createStatusBarItem(
+        vscode.StatusBarAlignment.Left,
+        0
+    )
+    status_bar.text = '$(circuit-board) CtrlOEM3'
+    status_bar.tooltip = 'CtrlOEM3: click to start'
+    status_bar.command = 'ctrl-oem3.start'
+    status_bar.show()
+
+    PIPE_CLIENT = new PipeClient(status_bar)
+
+    let show_output = vscode.commands.registerCommand(
+        'ctrl-oem3.show-output',
+        () => output.show()
+    )
+    let restart = vscode.commands.registerCommand('ctrl-oem3.restart', () => {
+        vscode.commands.executeCommand('ctrl-oem3.stop')
+        setTimeout(() => vscode.commands.executeCommand('ctrl-oem3.start'), 500)
     })
-    let stop = vscode.commands.registerCommand('ctrl-oem3.stop', () => {
-        command_stop(output)
+    let start = vscode.commands.registerCommand('ctrl-oem3.start', () =>
+        command_start(native_path, output, PIPE_CLIENT!)
+    )
+    let stop = vscode.commands.registerCommand('ctrl-oem3.stop', () =>
+        command_stop(output, PIPE_CLIENT!)
+    )
+
+    let config_change = vscode.workspace.onDidChangeConfiguration((e) => {
+        if (
+            e.affectsConfiguration('ctrl-oem3.matches-window-title') &&
+            PIPE_CLIENT?.started
+        ) {
+            output.appendLine(
+                '** Configuration changed, restarting the CtrlOEM3 service. '
+            )
+            vscode.commands.executeCommand('ctrl-oem3.restart')
+        }
     })
 
-    context.subscriptions.push(start, stop, output)
+    context.subscriptions.push(
+        show_output,
+        restart,
+        start,
+        stop,
+        config_change,
+        output,
+        status_bar
+    )
 
     if (
         vscode.workspace.getConfiguration('ctrl-oem3').get<boolean>('autostart')
@@ -138,91 +278,28 @@ export function activate(context: vscode.ExtensionContext) {
     }
 }
 
-// This method is called when your extension is deactivated
 export function deactivate() {
-    PIPE_CLIENT.disconnect()
+    PIPE_CLIENT?.disconnect()
 }
 
-function command_start(native_path: string, output: vscode.OutputChannel) {
-    output?.appendLine(`** Starting the CtrlOEM3 service. `)
-
-    let pattern = vscode.workspace
-        .getConfiguration('ctrl-oem3')
-        .get<string>('matches-window-title')
-    let encoded_pattern = Buffer.from(
-        new TextEncoder().encode(pattern)
-    ).toString('base64')
-
-    let hproc = cproc.spawn(
-        native_path,
-        [`--matches-window-title=${encoded_pattern}`],
-        {
-            detached: true,
-        }
-    )
-    if (hproc.pid === undefined) {
-        vscode.window
-            .showErrorMessage(
-                'Failed to start a CtrlOEM3 instance, check the output console for details. ',
-                'Show Output',
-                'Restart Extension'
-            )
-            .then((sel) => {
-                switch (sel) {
-                    case 'Show Output':
-                        output.show()
-                        break
-                    case 'Restart Extension':
-                        vscode.commands.executeCommand('ctrl-oem3.start')
-                        break
-                }
-            })
-    }
-
-    hproc.stdout.on('data', (data: any) => output.append(data.toString()))
-    hproc.stderr.on('data', (data: any) => output.append(data.toString()))
-    hproc.on('exit', (code) => {
-        if (code === 0) {
-            output.appendLine(
-                `** Current window's CtrlOEM3 instance exited as notified. `
-            )
-        } else {
-            output.appendLine(
-                `** Current window's CtrlOEM3 instance crashed, ExitCode=${code}. `
-            )
-            vscode.window
-                .showErrorMessage(
-                    'CtrlOEM3 crashed, check the output console for details. ',
-                    'Show Output',
-                    'Restart Extension'
-                )
-                .then((sel) => {
-                    switch (sel) {
-                        case 'Show Output':
-                            output.show()
-                            break
-                        case 'Restart Extension':
-                            vscode.commands.executeCommand('ctrl-oem3.start')
-                            break
-                    }
-                })
-        }
-    })
-
-    setTimeout(() => {
-        PIPE_CLIENT.connect(output)
-    }, 400)
+async function command_start(
+    native_path: string,
+    output: vscode.OutputChannel,
+    client: PipeClient
+) {
+    await client.connect(native_path, output)
 }
 
-function command_stop(output?: vscode.OutputChannel) {
+async function command_stop(
+    output?: vscode.OutputChannel,
+    client?: PipeClient
+) {
     output?.appendLine('** Stopping the CtrlOEM3 service. ')
+    client?.disconnect()
 
-    let client = net.connect(ID_PIPE_SERVER)
-
-    client.on('connect', () => {
-        client.write(Uint8Array.from([ID_PROTO_NOTIFY_STOP]))
+    let conn = net.connect(PIPE_SERVER)
+    conn.on('connect', () => {
+        conn.end(Uint8Array.from([REQUEST_SHUTDOWN]))
     })
-    client.on('error', (err) => {
-        output?.appendLine(`** Failed to stop the CtrlOEM3 service: ${err}`)
-    })
+    conn.on('error', () => {})
 }
